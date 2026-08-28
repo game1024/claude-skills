@@ -8,17 +8,19 @@ description: Use when the user asks to translate English .srt subtitle files for
 ## 输入
 - 单个 `.srt` 文件路径，或一个目录（批量翻译其中所有未翻译的 .srt）
 
-## 预处理：分片（翻译前先执行）
-数学视频时长可能达 40 分钟 ~ 1 小时（字幕约 600~1200 条），一次性翻译会超出上下文长度，**必须先分片**：
+## 预处理：修断行 + 分片（翻译前先执行）
+数学视频时长可能达 40 分钟 ~ 1 小时（字幕约 600~1200 条），一次性翻译会超出上下文长度，**必须先分片**。自动生成字幕常把一句拆成多行（条内不必要的换行），**先修复再分片**：
 
-1. 运行本技能目录下的拆分脚本（`python` 不可用时改试 `py`）：
-   `python C:\Users\ROG\.claude\skills\math-subtitle-translate\split_srt.py split "<字幕路径>" --per 200`
-2. 脚本按条目拆分，**保留原序号和时间轴**，输出到 `<字幕同目录>/_split_parts/`，命名为 `<原名>.part01.srt`、`<原名>.part02.srt`……
-3. 若只有 1 片（总条数 ≤ 200），说明文件不长，后续按单文件流程处理即可
+1. 运行本技能目录下的脚本合并条目内不必要的断行（只合并句子中间的分行，句号/问号等句末符处保留换行；`--out` 可另存新文件，默认原地修改）：
+   在本技能目录下执行：`python split_srt.py join "<字幕路径>"`
+2. 运行拆分脚本（`python` 不可用时改试 `py`）：
+   `python split_srt.py split "<字幕路径>" --per 200`
+3. 脚本按条目拆分，**保留原序号和时间轴**，输出到 `<字幕同目录>/_split_parts/`，命名为 `<原名>.part01.srt`、`<原名>.part02.srt`……
+4. 若只有 1 片（总条数 ≤ 200），说明文件不长，后续按单文件流程处理即可
 
 ## 翻译规则
 1. 只翻译文本行。序号、时间轴（`HH:MM:SS,mmm --> HH:MM:SS,mmm`）和空行结构原样保留
-2. 一个条目的文本跨多行时整体翻译，行数可以变化；不跨条目合并或拆分语义
+2. 一个条目的文本跨多行时整体翻译，**译文条目内尽量写成一行**，仅在句子结束处（句号/问号/感叹号/省略号等）才可断行；不要照搬英文原文的分行。不跨条目合并或拆分语义
 3. 保留 `<i>`、`<font>`、`{\an8}` 等字幕标签和 `♪`、`[...]` 等符号，只译其中文字
 4. **公式与数学符号原样保留**：
    - 字幕里的公式、LaTeX（`\frac{a}{b}`、`x^2 + 1`、`\sum_{i=1}^{n}`）和数学符号（`≤ ≥ ≠ ∈ ∑ ∫ √ π ∞`）不动，只翻译公式前后的文字
@@ -38,10 +40,12 @@ description: Use when the user asks to translate English .srt subtitle files for
 
 ## 合并（全部分片翻译完成后执行）
 1. 运行合并脚本：
-   `python C:\Users\ROG\.claude\skills\math-subtitle-translate\split_srt.py merge "<_split_parts 目录>" "<原目录>/<原名>.zh.srt" --zh`
+   在本技能目录下执行：`python split_srt.py merge "<_split_parts 目录>" "<原目录>/<原名>.zh.srt" --zh`
 2. 合并 = 按分片顺序拼接，序号连续、时间轴不变
-3. 删除临时目录 `_split_parts`
-4. 执行完成自检（见下）
+3. 对合并后的中文文件再执行一次 join，兜底修复条目内残留的不必要断行：
+   `python split_srt.py join "<原目录>/<原名>.zh.srt"`
+4. 删除临时目录 `_split_parts`
+5. 执行完成自检（见下）
 
 ## 输出
 - 最终产物 `<原名>.zh.srt`（如 `video.srt` → `video.zh.srt`），不覆盖原文件
