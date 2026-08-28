@@ -36,11 +36,4 @@ description: Use when the user asks to translate English .srt subtitle files int
 - 所有时间轴与原文完全相同
 
 ## 输出归档（翻译结束后执行）
-将对应的视频、英文原字幕、中文字幕三个文件复制到工作区的 `output/` 目录（相对于当前工作区根目录，目录不存在则先创建），并按规则重命名：
-
-1. **先询问用户**：本次是哪一 Part（前缀格式如 `Part1-1`，用 AskUserQuestion 或直接提问，等用户回答后再继续）
-2. **视频（.mp4）**：与 .srt 同目录下、同名的 .mp4（Glob 按原名查找）。新名称 = 前缀 + 原名中第一个空格及之后的部分（即把第一个空格前的内容替换成前缀）。例：`fund4_modeling_0460 Stand Topology Fix.mp4` + 前缀 `Part1-1` → `Part1-1 Stand Topology Fix.mp4`
-3. **英文字幕**：重命名为视频的新名称，保留 `.en.srt` 后缀。例：→ `Part1-1 Stand Topology Fix.en.srt`
-4. **中文字幕**：重命名为视频的新名称，后缀改为 `.srt`（去掉 `.zh`）。例：→ `Part1-1 Stand Topology Fix.srt`
-5. 用 `cp` 复制（不移动/不删除原文件），复制后列出 output 目录内容并报告结果
-6. 找不到对应 .mp4 时跳过视频步骤并在报告中说明
+见工作区 `CLAUDE.md`（输出归档与重命名规则已抽取至该文件）。
