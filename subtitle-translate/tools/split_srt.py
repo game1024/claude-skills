@@ -4,6 +4,7 @@
 用法：
   python split_srt.py split <input.srt> [--per 200] [--out DIR]
   python split_srt.py merge <parts_dir> <output.srt> [--zh]
+  python split_srt.py join <input.srt> [--out FILE]
 """
 import argparse
 import re
@@ -28,9 +29,13 @@ def read_srt(path: Path) -> str:
 
 
 def blocks(text: str):
-    """按空行把字幕文本拆成条目块列表（每个块 = 序号行 + 时间轴行 + 文本行）。"""
+    """按空行把字幕文本拆成条目块列表（每个块 = 序号行 + 时间轴行 + 文本行）。
+
+    剥离行尾 \\r：Windows 上 Path.write_text 的文本模式会把 \\n 转成 \\r\\n，
+    若行尾残留 \\r 会写出双重回车 \\r\\r\\n，播放器会判定字幕损坏。
+    """
     parts = re.split(r"\r?\n\s*\r?\n", text.strip("\n"))
-    return [p.strip("\n") for p in parts if p.strip()]
+    return [p.strip("\n").replace("\r", "") for p in parts if p.strip()]
 
 
 def split_cmd(args):
@@ -71,6 +76,57 @@ def merge_cmd(args):
     return 0
 
 
+_CJK_RE = re.compile(r"[一-鿿　-〿＀-￯]")
+_EN_SENT_END = ".!?…:;"
+_ZH_SENT_END = "。！？…：；"
+
+
+def join_cmd(args):
+    """合并条目内不必要的断行：一句被拆成多行时拼回一行，仅在句子结束处保留换行。
+
+    语言自动识别：条目含 CJK 字符按中文处理（拼接不加空格，句末符 。！？…：；），
+    否则按英文处理（拼接加空格，句末符 .!?…:;）。只改文本行，序号、时间轴、空行结构不变。
+    """
+    src = Path(args.input)
+    bs = blocks(read_srt(src))
+    if not bs:
+        print(f"未解析到字幕条目：{src}", file=sys.stderr)
+        return 1
+    out_blocks = []
+    changed = 0
+    for b in bs:
+        lines = b.split("\n")
+        if len(lines) < 3:  # 序号行 + 时间轴行 之后没有文本行
+            out_blocks.append(b)
+            continue
+        texts = lines[2:]
+        if not any(t.strip() for t in texts):
+            out_blocks.append(b)
+            continue
+        is_zh = any(_CJK_RE.search(t) for t in texts)
+        ends = _ZH_SENT_END if is_zh else _EN_SENT_END
+        sep = "" if is_zh else " "
+        new_texts = []
+        cur = ""
+        for i, t in enumerate(texts):
+            s = t.strip()
+            if not s:
+                continue
+            cur = s if not cur else cur + sep + s
+            if i < len(texts) - 1 and s[-1] in ends:
+                new_texts.append(cur)
+                cur = ""
+        if cur:
+            new_texts.append(cur)
+        if new_texts != texts:
+            changed += 1
+        out_blocks.append("\n".join(lines[:2] + new_texts))
+    out = Path(args.out) if args.out else src
+    out.write_text("\n\n".join(out_blocks) + "\n", encoding="utf-8")
+    print(f"join：{src} → {out}（{len(out_blocks)} 条字幕，其中 {changed} 条合并了断行）")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="SRT 字幕分片/合并工具")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -84,6 +140,10 @@ def main():
     mp.add_argument("output", help="合并输出 .srt 路径")
     mp.add_argument("--zh", action="store_true", help="合并译文分片（*.zh.srt）")
     mp.set_defaults(fn=merge_cmd)
+    jp = sub.add_parser("join", help="合并条目内不必要的断行（默认原地修改，--out 另存新文件）")
+    jp.add_argument("input", help="输入 .srt 路径")
+    jp.add_argument("--out", help="输出 .srt 路径（默认覆盖输入文件）")
+    jp.set_defaults(fn=join_cmd)
     args = ap.parse_args()
     return args.fn(args)
 
