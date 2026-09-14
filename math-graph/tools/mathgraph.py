@@ -369,12 +369,15 @@ def draw_axes(ax, xlim, ylim, points=()):
         arrow.arrow_patch.set_sketch_params(**SKETCH_ARROW)
 
     # 轴名标在箭头尖端外侧。位置固定，但要在 resolve_labels 里当作障碍物，
-    # 否则点/曲线标注会紧贴上来
+    # 否则点/曲线标注会紧贴上来。
+    # y 用居中而非右对齐：右对齐会让标签紧贴轴线吊在左上角，
+    # 看起来像箭头偏右（实测箭头本身是正的，是标签造成的错觉）
     fixed = [
         ax.text(xlim[1], ax_y, "$x$", ha="left", va="top", color=COLOR_AXIS,
                 zorder=1, clip_on=False, path_effects=HALO),
-        ax.text(ax_x, ylim[1], "$y$", ha="right", va="bottom", color=COLOR_AXIS,
-                zorder=1, clip_on=False, path_effects=HALO),
+        ax.annotate("$y$", xy=(ax_x, ylim[1]), xytext=(0, 3),
+                    textcoords="offset points", ha="center", va="bottom",
+                    color=COLOR_AXIS, zorder=1, clip_on=False, path_effects=HALO),
     ]
 
     # 原点 O 放在左下方（不压轴线）；轴不在原点相交时不画。
