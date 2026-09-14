@@ -14,15 +14,20 @@ DPI = 100
 SUBPLOT = dict(left=0.06, right=0.94, bottom=0.06, top=0.94)
 
 # 手绘抖动（Artist.set_sketch_params，单位为像素）
-# scale      : 抖动幅度（像素）—— 图越小看起来越夸张，300x300 下 1.5 约等于「略抖」
-# length     : 抖动波长（像素）—— 调大比调小更关键：小波长会变成毛刺噪点
+# scale      : 抖动幅度（像素）—— 图越小看起来越夸张
+# length     : 抖动波长（像素）—— 决定观感的主参数，见下方实测
 # randomness : 波长随机伸缩比例，越大越潦草
-# 取值依据：实测对比 (2.5,110,12) 呈高频毛刺，(1.5,400,5) 已看不出手绘；
-# length 调大比调小更关键——小波长会变成毛刺噪点
-SKETCH = dict(scale=1.5, length=200, randomness=3)
+# 实测（300x300 抛物线，scale=1.5, randomness=3）：
+#   length=10  密集锯齿，曲线像弹簧，已不是手绘
+#   length=30  高频波纹，像「波浪线」
+#   length=60  起伏明显，勉强算手绘
+#   length=120 平滑，抖动含蓄
+#   length=400 几乎看不出抖动
+# 幅度和波长要配着看：波长太短时，同样的幅度会从「轻微起伏」退化成「锯齿」
+SKETCH = dict(scale=1, length=100, randomness=3)
 
 # 箭头部位单独用更小的幅度，避免箭头尖端被抖毛
-SKETCH_ARROW = dict(scale=1.0, length=200, randomness=3)
+SKETCH_ARROW = dict(scale=1.0, length=100, randomness=3)
 
 # 重采样点距，取坐标区长边的比例。抖动按顶点位移，顶点密度会显著影响观感，
 # 统一到约 3 像素一个点后，三种曲线形式的抖动频率才一致（0.012 ≈ 3px @300x300）
