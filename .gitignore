@@ -1,1 +1,3 @@
 tax-filing/data/
+
+tax-filing/**/__pycache__/
