@@ -17,12 +17,12 @@ SUBPLOT = dict(left=0.06, right=0.94, bottom=0.06, top=0.94)
 # scale      : 抖动幅度（像素）—— 图越小看起来越夸张，300x300 下 1.5 约等于「略抖」
 # length     : 抖动波长（像素）—— 调大比调小更关键：小波长会变成毛刺噪点
 # randomness : 波长随机伸缩比例，越大越潦草
-# 取值依据：实测对比 (2.5,110,12) 呈高频毛刺，(1.5,400,5) 已看不出手绘，
-# (1.5,200,8) 是「看得出是手绘但仍干净」的一档
-SKETCH = dict(scale=1.5, length=200, randomness=8)
+# 取值依据：实测对比 (2.5,110,12) 呈高频毛刺，(1.5,400,5) 已看不出手绘；
+# length 调大比调小更关键——小波长会变成毛刺噪点
+SKETCH = dict(scale=1.5, length=200, randomness=3)
 
 # 箭头部位单独用更小的幅度，避免箭头尖端被抖毛
-SKETCH_ARROW = dict(scale=1.0, length=200, randomness=6)
+SKETCH_ARROW = dict(scale=1.0, length=200, randomness=3)
 
 # 重采样点距，取坐标区长边的比例。抖动按顶点位移，顶点密度会显著影响观感，
 # 统一到约 3 像素一个点后，三种曲线形式的抖动频率才一致（0.012 ≈ 3px @300x300）
