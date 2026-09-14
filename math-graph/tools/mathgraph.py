@@ -35,7 +35,7 @@ except ImportError:
 
 from mgconfig import (
     FIGSIZE, DPI, SUBPLOT,
-    SKETCH, SKETCH_ARROW, ALPHA_CURVE, HALO_WIDTH, LABEL_PAD,
+    SKETCH, SKETCH_AXIS, ALPHA_CURVE, HALO_WIDTH, LABEL_PAD,
     POINT_LABEL_OFFSET, LW_CURVE, LW_AXIS,
     COLORS, COLOR_AXIS, COLOR_POINT,
     MATHTEXT_FONTSET, MATHTEXT_DEFAULT, CJK_FONT,
@@ -366,7 +366,8 @@ def draw_axes(ax, xlim, ylim, points=()):
                        ((ax_x, ylim[1]), (ax_x, ylim[0]))):
         arrow = ax.annotate("", xy=end, xytext=start, zorder=1,
                             arrowprops=dict(**common))
-        arrow.arrow_patch.set_sketch_params(**SKETCH_ARROW)
+        # SKETCH_AXIS = None 时显式关掉抖动，画出干净直线
+        arrow.arrow_patch.set_sketch_params(**(SKETCH_AXIS or {}))
 
     # 轴名标在箭头尖端外侧。位置固定，但要在 resolve_labels 里当作障碍物，
     # 否则点/曲线标注会紧贴上来。
