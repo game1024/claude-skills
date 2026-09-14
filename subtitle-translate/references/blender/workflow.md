@@ -12,4 +12,6 @@
 4. 谐音梗或拿不准的专有名词，保留英文原文并在其后用括号注明译文
 
 ## 词表
-- 翻译开始前先阅读 `${CLAUDE_SKILL_DIR}/references/blender/glossary.md`（Blender 建模术语英中对照），译法以词表为准
+- 翻译开始前先阅读 `${CLAUDE_SKILL_DIR}/references/blender/glossary.md`（Blender 术语英中对照：建模 / 合成 / 渲染 / 美化 / ASR 误听），译法以词表为准
+- 词表按课程类型分节：建模（Modeling）、合成与渲染通道（Compositing、Rendering in Cycles）、合成器节点与混合模式、视觉效果与美化；翻译新课程时先查对应小节
+- 遇到词表未收录的新术语，翻译完成后把「英文 → 采用的中文」补进 `glossary.md` 对应小节（沿用首次出现时的译法，保证同一术语跨视频一致）
