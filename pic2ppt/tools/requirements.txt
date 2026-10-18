@@ -1,0 +1,15 @@
+# Required
+pillow>=10.0
+numpy>=1.24
+scipy>=1.10
+requests>=2.28
+
+# Strongly recommended: Telea inpainting for clean background repair
+opencv-python-headless>=4.8
+
+# Optional: fully local OCR (Chinese + English)
+# rapidocr>=3.0
+# onnxruntime>=1.17
+
+# Optional: Tesseract OCR backend
+# pytesseract>=0.3.10
