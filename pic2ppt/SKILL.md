@@ -11,6 +11,16 @@ description: 把幻灯片截图或图片转换成可编辑 PowerPoint（.pptx）
 python -m pip install -r "${CLAUDE_SKILL_DIR}/tools/requirements.txt"
 ```
 
+国内网络建议加中科大 PyPI 镜像加速（仅本次安装生效，不改全局配置）：
+
+```bash
+python -m pip install -r "${CLAUDE_SKILL_DIR}/tools/requirements.txt" \
+  -i https://mirrors.ustc.edu.cn/pypi/simple
+```
+
+需要长期使用时执行 `pip config set global.index-url https://mirrors.ustc.edu.cn/pypi/simple`；
+恢复官方源用 `pip config unset global.index-url`。
+
 必需：Pillow、numpy、scipy、requests。`requirements.txt` 里的 `opencv-python-headless`
 负责文字擦除、Poisson `seamlessClone` 融合和局部修复；`scikit-image` 负责渐变背景上的
 biharmonic 修复，建议保留。缺失时脚本会退化为 Telea 或纯 numpy 扩散填充。

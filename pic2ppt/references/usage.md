@@ -39,6 +39,24 @@
 pip install -r requirements.txt
 ```
 
+国内网络访问官方 PyPI 较慢时，可临时改用中科大镜像（`-i` 只对本次安装生效）：
+
+```bash
+pip install -r requirements.txt -i https://mirrors.ustc.edu.cn/pypi/simple
+```
+
+或写入 pip 全局配置（会改变之后所有 pip 安装的默认源）：
+
+```bash
+pip config set global.index-url https://mirrors.ustc.edu.cn/pypi/simple
+# 恢复官方源
+pip config unset global.index-url
+```
+
+镜像只改变下载来源，包内容仍来自 PyPI；长期使用后如遇版本不一致，可临时用
+`-i https://pypi.org/simple` 回到官方源。清华镜像
+（`https://pypi.tuna.tsinghua.edu.cn/simple`）可作为备用。
+
 `requirements.txt` 包含 `opencv-python-headless`，负责文字抹除、Poisson 融合和
 局部修复；`scikit-image` 用于渐变背景上的 biharmonic 修复，让字形擦除更平滑。
 缺少这两个库时脚本仍可运行，但背景修复会退化为 OpenCV Telea 或纯 numpy 扩散填充。

@@ -1,3 +1,7 @@
+# 国内网络可使用中科大 PyPI 镜像安装：
+#   pip install -r requirements.txt -i https://mirrors.ustc.edu.cn/pypi/simple
+# 需要长期生效：pip config set global.index-url https://mirrors.ustc.edu.cn/pypi/simple
+
 # Required
 pillow>=10.0
 numpy>=1.24
