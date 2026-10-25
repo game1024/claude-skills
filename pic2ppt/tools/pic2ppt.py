@@ -21,16 +21,17 @@ produced: text and extracted objects are removed from the background.
 What is automated here (classical CV + OCR) and what the original skill does
 with a vision agent:
 
-  * Text detection / content ........ OCR backend (PaddleOCR-VL cloud,
-                                       RapidOCR local, or Tesseract).
+  * Text detection / content ........ OCR backend (PP-OCRv6 cloud,
+                                       PaddleOCR-VL cloud, RapidOCR local,
+                                       or Tesseract).
   * Font size / color / bold ......... ink measurement ported from the skill.
   * Background repair ................ local diffusion inpainting (or flat fill
                                        when the surrounding region is uniform).
-  * Foreground separation ............ connected components + colour-distance
-                                       alpha matting (the skill uses image
-                                       editing for source-faithful separation;
-                                       use `--no-icons` if the matting quality
-                                       is not acceptable).
+  * Foreground separation ............ optional (off by default). Connected
+                                       components + colour-distance alpha
+                                       matting; enable with `--icons` when the
+                                       slide has isolated icons on clean
+                                       backgrounds.
   * Cards / dividers ................. conservative flat-colour rectangle and
                                        line detection.
   * Native tables / formulas ......... not reconstructed; they stay in the
@@ -66,7 +67,7 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 try:
     from scipy import ndimage
@@ -75,6 +76,14 @@ try:
 except Exception:  # pragma: no cover - scipy is a declared dependency
     ndimage = None
     HAVE_SCIPY = False
+
+try:
+    from skimage.restoration import inpaint_biharmonic
+
+    HAVE_SKIMAGE = True
+except Exception:  # optional dependency: smoother gradient repair
+    inpaint_biharmonic = None
+    HAVE_SKIMAGE = False
 
 try:
     import cv2  # type: ignore
@@ -115,6 +124,7 @@ MAX_TEXT_FILL = 0.65
 
 PADDLE_JOB_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
 PADDLE_DEFAULT_MODEL = "PaddleOCR-VL-1.6"
+PADDLE_OCR_MODEL = "PP-OCRv6"
 PADDLE_TEXT_LABELS = {
     "text",
     "paragraph_title",
@@ -123,6 +133,13 @@ PADDLE_TEXT_LABELS = {
     "vision_footnote",
     "table_title",
     "chart_title",
+    # Labels that PaddleOCR-VL emits around figures/charts and page chrome.
+    "figure_title",
+    "caption",
+    "footnote",
+    "header",
+    "footer",
+    "page_number",
 }
 
 WARNINGS: list[str] = []
@@ -630,30 +647,30 @@ def load_paddle_token(explicit: str | None) -> str | None:
     return None
 
 
-def paddleocr_vl_blocks(
-    image_path: Path, token: str, model: str = PADDLE_DEFAULT_MODEL, timeout: int = 300
+def _paddle_job_status(
+    image_path: Path,
+    token: str,
+    model: str,
+    optional_payload: dict,
+    timeout: int,
+    label: str,
 ) -> dict:
-    """Submit one image to PaddleOCR-VL and return its prunedResult."""
+    """Submit an image and poll until the PaddleOCR job finishes."""
     if not HAVE_REQUESTS:
-        raise RuntimeError("requests is required for --ocr paddleocr-vl (pip install requests).")
+        raise RuntimeError("requests is required for the Paddle OCR backends (pip install requests).")
     headers = {"Authorization": f"bearer {token}"}
-    optional = {
-        "useDocOrientationClassify": False,
-        "useDocUnwarping": False,
-        "useChartRecognition": False,
-    }
     with image_path.open("rb") as handle:
         response = requests.post(
             PADDLE_JOB_URL,
             headers=headers,
-            data={"model": model, "optionalPayload": json.dumps(optional)},
+            data={"model": model, "optionalPayload": json.dumps(optional_payload)},
             files={"file": handle},
             timeout=60,
         )
     if response.status_code != 200:
-        raise RuntimeError(f"PaddleOCR submit failed ({response.status_code}): {response.text[:300]}")
+        raise RuntimeError(f"{label} submit failed ({response.status_code}): {response.text[:300]}")
     job_id = response.json()["data"]["jobId"]
-    log(f"  PaddleOCR-VL job submitted: {job_id}")
+    log(f"  {label} job submitted: {job_id}")
 
     started = time.time()
     status = None
@@ -661,18 +678,41 @@ def paddleocr_vl_blocks(
         try:
             status = requests.get(f"{PADDLE_JOB_URL}/{job_id}", headers=headers, timeout=60).json()["data"]
         except Exception as exc:
-            raise RuntimeError(f"PaddleOCR status request failed: {exc}") from exc
+            raise RuntimeError(f"{label} status request failed: {exc}") from exc
         state = status.get("state")
         if state == "done":
-            break
+            return status
         if state == "failed":
-            raise RuntimeError(f"PaddleOCR job failed: {status.get('errorMsg')}")
+            raise RuntimeError(f"{label} job failed: {status.get('errorMsg')}")
         if time.time() - started > timeout:
-            raise RuntimeError(f"PaddleOCR job timed out after {timeout}s (state={state})")
+            raise RuntimeError(f"{label} job timed out after {timeout}s (state={state})")
         time.sleep(5)
 
-    jsonl = requests.get(status["resultUrl"]["jsonUrl"], timeout=60)
-    jsonl.raise_for_status()
+
+def _paddle_result_response(status: dict, label: str):
+    url = (status.get("resultUrl") or {}).get("jsonUrl")
+    if not url:
+        raise RuntimeError(f"{label} returned no result URL")
+    response = requests.get(url, timeout=60)
+    response.raise_for_status()
+    return response
+
+
+def paddleocr_vl_blocks(
+    image_path: Path,
+    token: str,
+    model: str = PADDLE_DEFAULT_MODEL,
+    timeout: int = 300,
+    chart_recognition: bool = False,
+) -> dict:
+    """Submit one image to PaddleOCR-VL and return its prunedResult."""
+    optional = {
+        "useDocOrientationClassify": False,
+        "useDocUnwarping": False,
+        "useChartRecognition": bool(chart_recognition),
+    }
+    status = _paddle_job_status(image_path, token, model, optional, timeout, "PaddleOCR-VL")
+    jsonl = _paddle_result_response(status, "PaddleOCR-VL")
     pages = []
     for line in jsonl.text.strip().split("\n"):
         if not line.strip():
@@ -680,8 +720,30 @@ def paddleocr_vl_blocks(
         for result in json.loads(line)["result"]["layoutParsingResults"]:
             pages.append(result["prunedResult"])
     if not pages:
-        raise RuntimeError("PaddleOCR returned no pages")
+        raise RuntimeError("PaddleOCR-VL returned no pages")
     return pages[0]
+
+
+def paddleocr_v6_blocks(
+    image_path: Path,
+    token: str,
+    model: str = PADDLE_OCR_MODEL,
+    timeout: int = 300,
+) -> dict:
+    """Submit one image to PP-OCRv6 and return the full result payload.
+
+    PP-OCRv6 returns line-level `rec_texts` / `rec_boxes` instead of
+    PaddleOCR-VL's layout blocks, which maps directly to this tool's text
+    reconstruction flow. Orientation and unwarping are disabled so the
+    returned coordinates stay aligned with the source image.
+    """
+    optional = {
+        "useDocOrientationClassify": False,
+        "useDocUnwarping": False,
+        "useTextlineOrientation": False,
+    }
+    status = _paddle_job_status(image_path, token, model, optional, timeout, "PP-OCRv6")
+    return _paddle_result_response(status, "PP-OCRv6").json()
 
 
 def _box_from_points(points) -> list[float]:
@@ -691,7 +753,12 @@ def _box_from_points(points) -> list[float]:
 
 
 def rapidocr_blocks(image_path: Path) -> list[dict]:
-    """Local RapidOCR backend. Returns line-level blocks."""
+    """Local RapidOCR backend. Returns line-level blocks.
+
+    Small images (diagrams, exported slides) are upscaled 2x before
+    recognition; PP-OCR often misses small labels below ~600px. Boxes are
+    mapped back to source pixels.
+    """
     try:
         from rapidocr import RapidOCR  # type: ignore
     except Exception:
@@ -702,15 +769,57 @@ def rapidocr_blocks(image_path: Path) -> list[dict]:
                 "RapidOCR is not installed. Install it with: pip install rapidocr onnxruntime"
             ) from exc
 
+    import logging
+    import tempfile
+
+    for logger_name in ("RapidOCR", "rapidocr"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+
+    with Image.open(image_path) as source_image:
+        source_width, source_height = source_image.size
+        longest = max(source_width, source_height)
+        if longest < 400:
+            scale = 3
+        elif longest < 1200:
+            scale = 2
+        else:
+            scale = 1
+        if scale > 1:
+            upscaled = source_image.convert("RGB").resize(
+                (source_width * scale, source_height * scale), Image.LANCZOS
+            )
+        else:
+            upscaled = None
+
     engine = RapidOCR()
-    result = engine(str(image_path))
+    temporary_path = None
+    try:
+        if upscaled is not None:
+            handle = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            temporary_path = Path(handle.name)
+            handle.close()
+            upscaled.save(temporary_path, "PNG")
+            result = engine(str(temporary_path))
+        else:
+            result = engine(str(image_path))
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
     boxes = []
     texts = []
     scores = []
     if hasattr(result, "boxes"):
-        boxes = list(getattr(result, "boxes") or [])
-        texts = list(getattr(result, "txts") or [])
-        scores = list(getattr(result, "scores") or [])
+        # RapidOCR 3.x returns numpy arrays here; `or []` would raise an
+        # ambiguous-truth-value error, so test for None explicitly.
+        raw_boxes = getattr(result, "boxes", None)
+        raw_texts = getattr(result, "txts", None)
+        raw_scores = getattr(result, "scores", None)
+        boxes = list(raw_boxes) if raw_boxes is not None else []
+        texts = list(raw_texts) if raw_texts is not None else []
+        scores = list(raw_scores) if raw_scores is not None else []
     elif isinstance(result, tuple):
         data = result[0] or []
         for row in data:
@@ -736,10 +845,13 @@ def rapidocr_blocks(image_path: Path) -> list[dict]:
         text = str(text).strip()
         if not text:
             continue
+        box_px = _box_from_points(box)
+        if scale > 1:
+            box_px = [value / scale for value in box_px]
         blocks.append(
             {
                 "text": text,
-                "box_px": _box_from_points(box),
+                "box_px": box_px,
                 "confidence": confidence,
                 "label": "text",
             }
@@ -841,16 +953,65 @@ def blocks_from_paddle(pruned: dict, source_width: int, source_height: int) -> l
     return blocks
 
 
+def blocks_from_paddle_ocr(payload: dict, source_width: int, source_height: int) -> list[dict]:
+    """Convert a PP-OCRv6 result payload into line-level text blocks."""
+    result = payload.get("result") or {}
+    pages = result.get("ocrResults") or []
+    if not pages:
+        raise RuntimeError("PP-OCRv6 returned no pages")
+    pruned = pages[0].get("prunedResult") or {}
+    info = result.get("dataInfo") or {}
+    scale_x = source_width / float(info.get("width") or source_width)
+    scale_y = source_height / float(info.get("height") or source_height)
+
+    texts = pruned.get("rec_texts") or []
+    scores = pruned.get("rec_scores") or []
+    boxes = pruned.get("rec_boxes") or []
+    polys = pruned.get("rec_polys") or []
+    blocks = []
+    for index, raw_text in enumerate(texts):
+        text = str(raw_text).strip()
+        if not text:
+            continue
+        if index < len(boxes):
+            x1, y1, x2, y2 = (float(v) for v in boxes[index])
+        elif index < len(polys):
+            points = polys[index]
+            xs = [float(point[0]) for point in points]
+            ys = [float(point[1]) for point in points]
+            x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+        else:
+            continue
+        x1, y1 = x1 * scale_x, y1 * scale_y
+        x2, y2 = x2 * scale_x, y2 * scale_y
+        x1, y1 = max(0.0, x1), max(0.0, y1)
+        x2, y2 = min(float(source_width), x2), min(float(source_height), y2)
+        if x2 - x1 < 2 or y2 - y1 < 2:
+            continue
+        confidence = float(scores[index]) if index < len(scores) else 1.0
+        if confidence < 0.45:
+            continue
+        blocks.append(
+            {
+                "text": text,
+                "box_px": [x1, y1, x2 - x1, y2 - y1],
+                "confidence": confidence,
+                "label": "text",
+            }
+        )
+    return blocks
+
+
 def detect_ocr_backend(requested: str) -> str:
     if requested != "auto":
-        if requested == "paddleocr-vl" and not load_paddle_token(None):
+        if requested in ("ppocrv6", "paddleocr-vl") and not load_paddle_token(None):
             raise SystemExit(
-                "No PaddleOCR-VL token found. Set PADDLE_OCR_TOKEN, pass --paddle-token, "
+                "No Paddle OCR token found. Set PADDLE_OCR_TOKEN, pass --paddle-token, "
                 "or run `editppt config --paddle-ocr-token <token>`."
             )
         return requested
     if load_paddle_token(None):
-        return "paddleocr-vl"
+        return "ppocrv6"
     try:
         import importlib.util
 
@@ -875,13 +1036,16 @@ def run_ocr(
     model: str,
     source_width: int,
     source_height: int,
+    chart_recognition: bool = False,
 ) -> tuple[str, list[dict]]:
     """Return (backend_used, blocks). Falls back gracefully in auto mode."""
     if backend == "auto":
         backend = detect_ocr_backend("auto")
     order = [backend]
-    if backend == "paddleocr-vl":
+    if backend == "ppocrv6":
         order += ["rapidocr", "tesseract", "none"]
+    elif backend == "paddleocr-vl":
+        order += ["ppocrv6", "rapidocr", "tesseract", "none"]
     elif backend == "rapidocr":
         order += ["tesseract", "none"]
     elif backend == "tesseract":
@@ -889,11 +1053,25 @@ def run_ocr(
 
     for candidate in order:
         try:
+            if candidate == "ppocrv6":
+                if not token:
+                    raise RuntimeError("missing Paddle OCR token")
+                payload = paddleocr_v6_blocks(image_path, token)
+                blocks = blocks_from_paddle_ocr(payload, source_width, source_height)
+                if not blocks:
+                    raise RuntimeError("PP-OCRv6 returned no text blocks")
+                return candidate, blocks
             if candidate == "paddleocr-vl":
                 if not token:
                     raise RuntimeError("missing PaddleOCR-VL token")
-                pruned = paddleocr_vl_blocks(image_path, token, model)
-                return candidate, blocks_from_paddle(pruned, source_width, source_height)
+                pruned = paddleocr_vl_blocks(image_path, token, model, chart_recognition=chart_recognition)
+                blocks = blocks_from_paddle(pruned, source_width, source_height)
+                if not blocks:
+                    # PaddleOCR-VL's layout parser sometimes labels a whole
+                    # diagram page as a single `image` block and returns no
+                    # text. Fall through to a line-level local OCR backend.
+                    raise RuntimeError("PaddleOCR-VL returned no text blocks")
+                return candidate, blocks
             if candidate == "rapidocr":
                 return candidate, rapidocr_blocks(image_path)
             if candidate == "tesseract":
@@ -1116,9 +1294,16 @@ def build_text_items(
                 item["line_height"] = round(max(1.0, min(1.6, line_height)), 3)
         items.append(item)
 
-        removal: dict = {"box": box, "mask": None, "kind": "text", "text": text[:40]}
+        removal: dict = {
+            "box": box,
+            "mask": None,
+            "ink_mask": None,
+            "kind": "text",
+            "text": text[:40],
+        }
         if mask is not None and mask_box is not None:
             removal["mask_box"] = mask_box
+            removal["ink_mask"] = mask
             dilated = mask
             if HAVE_SCIPY:
                 # Large type carries a wider antialiasing halo; dilating by a
@@ -1150,6 +1335,13 @@ def build_text_items(
         bx, by, bw, bh = clamp_box(block["box_px"], source_width, source_height)
         if bw < 4 or bh < 4:
             continue
+        confidence = float(block.get("confidence", 1.0) or 1.0)
+        # Tiny low-confidence fragments are usually map lines, arrowheads,
+        # icon details, or logo marks mistaken for text.
+        if len(text) <= 2 and confidence < 0.92 and bw < 34 and bh < 34:
+            continue
+        if len(text) <= 6 and text.isascii() and confidence < 0.75 and bw < 48 and bh < 26:
+            continue
         gray_crop = gray[by : by + bh, bx : bx + bw]
         rgb_crop = rgb[by : by + bh, bx : bx + bw]
         measured = measure_crop(gray_crop)
@@ -1163,6 +1355,40 @@ def build_text_items(
             polarity = measured["polarity"]
             bands = measured.get("bands") or []
             text_lines = [line for line in text.splitlines() if line.strip()]
+
+            # A 3D disc/ribbon often has a thin specular highlight that looks
+            # like ink to the thresholder. When OCR returned a single line,
+            # discard bands much shorter than the tallest one and tighten the
+            # measured box to the real text band. Otherwise the highlight is
+            # counted as a second line and the font size is badly underestimated.
+            if len(bands) >= 2 and len(text_lines) <= 1:
+                tallest_band = max(bottom - top for top, bottom in bands)
+                kept_bands = [
+                    (top, bottom)
+                    for top, bottom in bands
+                    if (bottom - top) >= tallest_band * 0.5
+                ]
+                dropped_bands = [band for band in bands if band not in kept_bands]
+                only_edge_bands = all(
+                    top <= 2 or bottom >= mask.shape[0] - 2
+                    for top, bottom in dropped_bands
+                )
+                if (
+                    len(kept_bands) == 1
+                    and len(kept_bands) < len(bands)
+                    and only_edge_bands
+                ):
+                    band_top, band_bottom = kept_bands[0]
+                    band_mask = mask[band_top:band_bottom]
+                    columns = np.flatnonzero(band_mask.any(axis=0))
+                    if columns.size:
+                        mx = int(columns[0])
+                        mw = int(columns[-1] - columns[0] + 1)
+                        my = int(band_top)
+                        mh = int(band_bottom - band_top)
+                        glyph = float(mh)
+                        line_count = 1
+                        bands = kept_bands
 
             # A block that contains a large heading and a small body line is
             # two text levels, not one. Split it into per-band text boxes so
@@ -1212,8 +1438,16 @@ def build_text_items(
                         continue
 
             # One OCR string can cover several visual lines without newlines.
-            # Re-flow it to the measured line count.
-            if len(bands) >= 2 and len(text_lines) < len(bands):
+            # Re-flow it to the measured line count. Short ASCII tokens such
+            # as stage numbers ("01", "02", "KPI") are kept intact: a shading
+            # edge or 3D disc can create a false horizontal ink gap that looks
+            # like two lines.
+            short_ascii_token = (
+                len(text.strip()) <= 3
+                and text.strip().isascii()
+                and not any(character.isspace() for character in text)
+            )
+            if len(bands) >= 2 and len(text_lines) < len(bands) and not short_ascii_token:
                 widths = []
                 for band_top, band_bottom in bands:
                     band_mask = mask[band_top:band_bottom]
@@ -1305,40 +1539,432 @@ def build_text_items(
     return items, removals, hints
 
 
+def _removal_background_std(rgb: np.ndarray, removal: dict) -> float:
+    """Colour spread of the non-text pixels inside a removal box.
+
+    A low ring MAD only says the immediate border is uniform. A big poster
+    title can still sit on top of an illustration whose limbs/doodles enter
+    the text box; inpainting that box would smear them. Measuring the
+    non-glyph pixels inside the box catches that case.
+    """
+    box = removal.get("box")
+    if not box:
+        return 0.0
+    height, width = rgb.shape[:2]
+    x, y, w, h = [int(round(v)) for v in box]
+    x1, y1 = max(0, x), max(0, y)
+    x2, y2 = min(width, x + w), min(height, y + h)
+    crop = rgb[y1:y2, x1:x2]
+    if crop.size == 0:
+        return 0.0
+    mask = removal.get("mask")
+    if mask is None:
+        pixels = crop.reshape(-1, 3)
+    else:
+        text_mask = np.zeros(crop.shape[:2], dtype=bool)
+        mask_box = removal.get("mask_box") or box
+        mx, my = [int(round(v)) for v in mask_box[:2]]
+        ox, oy = mx - x1, my - y1
+        ty1, ty2 = max(0, oy), min(crop.shape[0], oy + mask.shape[0])
+        tx1, tx2 = max(0, ox), min(crop.shape[1], ox + mask.shape[1])
+        if ty2 > ty1 and tx2 > tx1:
+            text_mask[ty1:ty2, tx1:tx2] = mask[ty1 - oy : ty2 - oy, tx1 - ox : tx2 - ox]
+        pixels = crop[~text_mask]
+    if pixels.size == 0:
+        return 999.0
+    return float(np.max(np.std(pixels.astype(np.float32), axis=0)))
+
+
+def _text_mask_in_patch(removal: dict, x0: int, y0: int, width: int, height: int) -> np.ndarray:
+    """Place a text removal mask into a patch's local coordinates."""
+    mask = np.zeros((height, width), dtype=bool)
+    source = removal.get("mask")
+    mask_box = removal.get("mask_box")
+    if source is None or mask_box is None:
+        return mask
+    ox = int(round(float(mask_box[0]))) - x0
+    oy = int(round(float(mask_box[1]))) - y0
+    sx0, sy0 = max(0, ox), max(0, oy)
+    sx1 = min(width, ox + source.shape[1])
+    sy1 = min(height, oy + source.shape[0])
+    if sx1 > sx0 and sy1 > sy0:
+        mask[sy0:sy1, sx0:sx1] = source[sy0 - oy : sy1 - oy, sx0 - ox : sx1 - ox]
+    return mask
+
+
+def _smooth_closed_polygon(points: list[tuple[float, float]], iterations: int = 2) -> list[tuple[float, float]]:
+    """Chaikin corner-cutting for a closed polygon.
+
+    approxPolyDP keeps the contour compact but leaves straight segments that
+    look faceted on ribbons and end caps. Two Chaikin passes keep the same
+    silhouette while making PowerPoint's freeform edge visually smooth.
+    """
+    if len(points) < 3:
+        return points
+    smoothed = np.asarray(points, dtype=np.float64)
+    for _ in range(max(0, iterations)):
+        following = np.roll(smoothed, -1, axis=0)
+        first = 0.75 * smoothed + 0.25 * following
+        second = 0.25 * smoothed + 0.75 * following
+        merged = np.empty((len(smoothed) * 2, 2), dtype=np.float64)
+        merged[0::2] = first
+        merged[1::2] = second
+        smoothed = merged
+        if len(smoothed) > 160:
+            break
+    return [(float(point[0]), float(point[1])) for point in smoothed]
+
+
+def gradient_backdrop_shape(
+    rgb: np.ndarray,
+    item: dict,
+    removal: dict,
+    other_boxes: list[list[float]],
+    *,
+    max_mae: float = 30.0,
+) -> dict | None:
+    """Build a native gradient patch behind text that cannot be flat-filled.
+
+    Text sitting on a smooth coloured band (ribbons, badges, end caps) often
+    fails the flat-repair gate even though its local background is a clean
+    linear gradient. In that case a native rectangle with a fitted linear
+    gradient can cover the old pixels exactly, so the text becomes editable
+    without leaving a flat rectangular hole. Complex photos/illustrations
+    fail the colour-consistency and fit-error checks and stay raster.
+    """
+    if not HAVE_CV2:
+        return None
+    bx, by, bw, bh = (float(v) for v in item["box_px"])
+    if bw < 18 or bh < 12:
+        return None
+    pad = max(1, min(5, int(round(min(bw, bh) * 0.04))))
+    x0 = max(0, int(round(bx - pad)))
+    y0 = max(0, int(round(by - pad)))
+    x1 = min(int(rgb.shape[1]), int(round(bx + bw + pad)))
+    y1 = min(int(rgb.shape[0]), int(round(by + bh + pad)))
+    width, height = x1 - x0, y1 - y0
+    if width < 12 or height < 10:
+        return None
+    patch_box = [x0, y0, width, height]
+    for box in other_boxes:
+        if boxes_overlap(patch_box, box, margin=1.0):
+            return None
+
+    crop = rgb[y0:y1, x0:x1]
+    text_mask = _text_mask_in_patch(removal, x0, y0, width, height)
+    non_text = ~text_mask
+    if int(non_text.sum()) < 40:
+        return None
+
+    hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
+    saturation = hsv[..., 1].astype(np.float32) / 255.0
+    value = hsv[..., 2].astype(np.float32) / 255.0
+    coloured = (saturation >= 0.18) & (value >= 0.10)
+    if float(coloured[non_text].mean()) < 0.90:
+        return None
+    text_left = int(round(bx)) - x0
+    text_top = int(round(by)) - y0
+    text_right = text_left + int(round(bw))
+    text_bottom = text_top + int(round(bh))
+    text_region = coloured[max(0, text_top) : min(height, text_bottom), max(0, text_left) : min(width, text_right)]
+    if text_region.size == 0 or float(text_region.mean()) < 0.75:
+        return None
+
+    # Fit only the saturated band pixels. The light-blue edge/background is
+    # part of the patch box but not part of the band behind the glyphs;
+    # including it would drag the fitted gradient toward a pale colour and
+    # make the patch visible.
+    saturated = (saturation >= 0.35) & (value >= 0.10)
+    fit_mask = non_text & saturated
+    if int(fit_mask.sum()) < max(60, int(0.08 * width * height)):
+        return None
+
+    hues = hsv[..., 0][fit_mask].astype(np.int32)
+    histogram = np.bincount(hues, minlength=180)
+    dominant = int(histogram.argmax())
+    hue_distance = np.abs((hues - dominant + 90) % 180 - 90)
+    if float((hue_distance <= 12).mean()) < 0.70:
+        return None
+
+    ys, xs = np.nonzero(fit_mask)
+    pixels = crop[ys, xs].astype(np.float32)
+    design = np.column_stack([xs, ys, np.ones_like(xs)]).astype(np.float32)
+    coefficients, _residuals, _rank, _singular = np.linalg.lstsq(design, pixels, rcond=None)
+    predicted = np.clip(design @ coefficients, 0, 255)
+    gradient_mae = float(np.abs(predicted - pixels).mean())
+    solid_mae = float(np.abs(pixels - pixels.mean(axis=0)).mean())
+    if gradient_mae > max_mae or gradient_mae > solid_mae + 0.75:
+        return None
+
+    luminance_gradient = coefficients[:2] @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    if float(np.hypot(*luminance_gradient)) < 0.02:
+        return None
+    angle = float(np.degrees(np.arctan2(float(luminance_gradient[1]), float(luminance_gradient[0]))) % 360.0)
+    direction = np.array([np.cos(np.radians(angle)), np.sin(np.radians(angle))], dtype=np.float32)
+    projection = xs * direction[0] + ys * direction[1]
+    low, high = np.percentile(projection, [5, 95])
+    if float(high - low) < 2.0:
+        return None
+    colour_low = pixels[projection <= low].mean(axis=0)
+    colour_high = pixels[projection >= high].mean(axis=0)
+    if float(np.abs(colour_low - colour_high).mean()) < 0.5:
+        return None
+
+    fill = {
+        "type": "gradient",
+        "angle": round(angle, 1),
+        "stops": [
+            {"pos": 0.0, "color": hex_color_from_rgb(colour_low)},
+            {"pos": 1.0, "color": hex_color_from_rgb(colour_high)},
+        ],
+    }
+    shrink = max(1, int(round(min(width, height) * 0.02)))
+    shape = {
+        "type": "rect",
+        "box_px": [
+            x0 + shrink,
+            y0 + shrink,
+            max(2, width - 2 * shrink),
+            max(2, height - 2 * shrink),
+        ],
+        "fill": fill,
+        "stroke": "none",
+        "source": "fitted-gradient-backdrop",
+        "reason": "text sits on a smooth coloured gradient; local patch rebuilt as a native gradient shape",
+    }
+
+    # Prefer a freeform that follows the coloured band instead of a rectangle:
+    # it covers the glyphs without painting the pale background corners.
+    if HAVE_SCIPY:
+        band = ((saturation >= 0.35) & (value >= 0.10)).astype(np.uint8)
+        band = cv2.morphologyEx(band, cv2.MORPH_CLOSE, np.ones((3, 3), dtype=np.uint8))
+        band = ndimage.binary_fill_holes(band).astype(np.uint8)
+        count, labels, stats, _centroids = cv2.connectedComponentsWithStats(band, 8)
+        best_label = 0
+        best_overlap = -1
+        for label_index in range(1, count):
+            component = labels == label_index
+            overlap = int((component & text_mask).sum())
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_label = label_index
+        if best_label:
+            component = (labels == best_label).astype(np.uint8)
+            component = cv2.dilate(component, np.ones((3, 3), dtype=np.uint8), iterations=1)
+            if text_mask.any():
+                coverage = float(component[text_mask].mean())
+            else:
+                coverage = 1.0
+            if coverage >= 0.97:
+                # The dilated component guarantees glyph coverage; the drawn
+                # shape is eroded by one pixel so the patch sits slightly
+                # inside the colour band instead of bleeding past it.
+                shape_component = cv2.erode(
+                    component, np.ones((3, 3), dtype=np.uint8), iterations=1
+                )
+                refined_fill = fill
+                component_ys, component_xs = np.nonzero((shape_component > 0) & fit_mask)
+                if component_ys.size >= 80:
+                    component_pixels = crop[component_ys, component_xs].astype(np.float32)
+                    projection = (
+                        component_xs.astype(np.float32) * direction[0]
+                        + component_ys.astype(np.float32) * direction[1]
+                    )
+                    low, high = np.percentile(projection, [5, 95])
+                    if float(high - low) >= 2.0:
+                        stops = []
+                        for position, fraction in ((0.0, 0.05), (0.5, 0.5), (1.0, 0.95)):
+                            target = float(low + (high - low) * fraction)
+                            half_width = max(1.0, float(high - low) * 0.12)
+                            selected = np.abs(projection - target) <= half_width
+                            if selected.any():
+                                sample = component_pixels[selected]
+                            else:
+                                nearest = int(np.argmin(np.abs(projection - target)))
+                                sample = component_pixels[[nearest]]
+                            stops.append(
+                                {
+                                    "pos": position,
+                                    "color": hex_color_from_rgb(np.median(sample, axis=0)),
+                                }
+                            )
+                        refined_fill = {
+                            "type": "gradient",
+                            "angle": round(angle, 1),
+                            "stops": stops,
+                        }
+                contours, _hierarchy = cv2.findContours(
+                    shape_component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )
+                if contours:
+                    contour = max(contours, key=cv2.contourArea)
+                    if cv2.contourArea(contour) >= 0.15 * width * height:
+                        epsilon = max(0.8, 0.003 * cv2.arcLength(contour, True))
+                        approx = cv2.approxPolyDP(contour, epsilon, True)
+                        if len(approx) >= 3:
+                            raw_points = [
+                                (float(point[0][0]), float(point[0][1]))
+                                for point in approx
+                            ]
+                            smoothed = _smooth_closed_polygon(raw_points, iterations=2)
+                            points = [
+                                [x0 + int(round(point[0])), y0 + int(round(point[1]))]
+                                for point in smoothed
+                            ]
+                            point_x = [point[0] for point in points]
+                            point_y = [point[1] for point in points]
+                            box = [min(point_x), min(point_y), max(point_x) - min(point_x), max(point_y) - min(point_y)]
+                            if box[2] >= 4 and box[3] >= 4:
+                                shape = {
+                                    "type": "freeform",
+                                    "box_px": box,
+                                    "path_px": points,
+                                    "fill": refined_fill,
+                                    "stroke": "none",
+                                                                "source": "fitted-gradient-backdrop",
+                                    "reason": "text sits on a smooth coloured band; local band rebuilt as a native freeform gradient shape",
+                                }
+    return shape
+
+
+def _background_std_without_text_colour(
+    rgb: np.ndarray,
+    removal: dict,
+    item: dict,
+    tolerance: float = 90.0,
+) -> float:
+    """Background spread after ignoring decorations in the text colour.
+
+    Coloured headings often include a small bar/underline drawn in the same
+    colour as the glyphs (for example "| 资源配置"). Those decoration pixels
+    are inside the OCR box but are not glyphs, so they inflate the background
+    spread and block a safe repair. Ignoring pixels close to the measured text
+    colour lets the text become native while the decoration stays in the base.
+    """
+    box = removal.get("box")
+    colour = item.get("color")
+    if not box or not colour:
+        return 999.0
+    height, width = rgb.shape[:2]
+    x, y, w, h = [int(round(v)) for v in box]
+    x1, y1 = max(0, x), max(0, y)
+    x2, y2 = min(width, x + w), min(height, y + h)
+    crop = rgb[y1:y2, x1:x2]
+    if crop.size == 0:
+        return 999.0
+    text_mask = _text_mask_in_patch(removal, x1, y1, x2 - x1, y2 - y1)
+    pixels = crop[~text_mask].astype(np.float32)
+    if pixels.size == 0:
+        return 999.0
+    text_colour = np.array(rgb_from_hex(colour), dtype=np.float32)
+    distance = np.linalg.norm(pixels - text_colour, axis=1)
+    remaining = pixels[distance > tolerance]
+    if remaining.shape[0] < 50:
+        return 999.0
+    return float(np.max(np.std(remaining, axis=0)))
+
+
 def filter_repairable_text(
     text_items: list[dict],
     removals: list[dict],
     hints: list[dict],
     rgb: np.ndarray,
     mad_threshold: float = 15.0,
-) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
+    std_threshold: float = 20.0,
+    gradient_backdrops: bool = True,
+) -> tuple[list[dict], list[dict], list[dict], list[dict], list[dict]]:
     """Keep native text only where the background can be repaired cleanly.
 
-    Text over photos, 3D objects or heavy illustration has a high ring MAD.
-    Removing it without an image-generation model leaves smears or ghost
-    artifacts, so it is intentionally kept as raster (and reported) instead
-    of being duplicated by a native box.
+    Two conditions must hold: the ring just outside the text box is uniform
+    (low MAD), and the non-text pixels inside the box are not a busy
+    illustration (low colour spread). Text over photos, 3D objects or heavy
+    illustration is intentionally kept as raster (and reported) instead of
+    being duplicated by a native box that would leave smears or ghosts.
+
+    When flat repair fails but the local background is a smooth colour
+    gradient, a native gradient rectangle is placed over the old pixels and
+    the text stays editable. The returned fifth list contains those shapes.
     """
     kept_items: list[dict] = []
     kept_removals: list[dict] = []
     kept_hints: list[dict] = []
     raster_text: list[dict] = []
-    for item, removal, hint in zip(text_items, removals, hints):
+    backdrop_shapes: list[dict] = []
+    boxes = [item.get("box_px") for item in text_items]
+    for index, (item, removal, hint) in enumerate(zip(text_items, removals, hints)):
         _ring, _std, mad = sample_ring(rgb, removal.get("box") or item["box_px"], band=3)
-        if mad <= mad_threshold:
-            kept_items.append(item)
-            kept_removals.append(removal)
-            kept_hints.append(hint)
-        else:
-            raster_text.append(
-                {
-                    "text": item.get("text", ""),
-                    "box_px": item.get("box_px"),
-                    "ring_mad": round(float(mad), 2),
-                    "reason": "background is too complex for a clean local repair; kept as raster",
-                }
+        background_std = _removal_background_std(rgb, removal)
+        tight_repair = False
+        effective_std = background_std
+        text_colour = item.get("color")
+        colour_contrast = 0.0
+        if text_colour:
+            colour_contrast = float(
+                np.linalg.norm(
+                    np.array(rgb_from_hex(text_colour), dtype=np.float32)
+                    - np.asarray(_ring, dtype=np.float32)
+                )
             )
-    return kept_items, kept_removals, kept_hints, raster_text
+        if (
+            mad <= mad_threshold
+            and background_std > std_threshold
+            and colour_contrast >= 60.0
+        ):
+            adjusted_std = _background_std_without_text_colour(rgb, removal, item)
+            if adjusted_std <= std_threshold and _edges_are_flat(
+                rgb, removal.get("box") or item["box_px"]
+            ):
+                effective_std = adjusted_std
+                tight_repair = True
+        if mad <= mad_threshold and effective_std <= std_threshold:
+            kept_items.append(item)
+            if tight_repair:
+                tight_removal = dict(removal)
+                tight_removal["tight"] = True
+                tight_removal["text_color"] = item.get("color")
+                kept_removals.append(tight_removal)
+            else:
+                kept_removals.append(removal)
+            kept_hints.append(hint)
+            continue
+
+        backdrop = None
+        if gradient_backdrops:
+            other_boxes = [box for position, box in enumerate(boxes) if position != index and box]
+            backdrop = gradient_backdrop_shape(rgb, item, removal, other_boxes)
+        if backdrop is not None:
+            if re.fullmatch(r"\d{1,4}", item.get("text", "").strip()):
+                # Large stage numbers sit on shaded 3D discs. Tight glyph
+                # repair already leaves a clean base; overlaying a gradient
+                # patch here would show as a rectangular colour block.
+                numeric_removal = dict(removal)
+                numeric_removal["tight"] = True
+                numeric_removal["text_color"] = item.get("color")
+                kept_items.append(item)
+                kept_removals.append(numeric_removal)
+                kept_hints.append(hint)
+                continue
+            backdrop["id"] = f"g{len(backdrop_shapes) + 1:03d}"
+            backdrop["z_index"] = 5.0 + len(backdrop_shapes) * 0.01
+            backdrop_shapes.append(backdrop)
+            item["backdrop_shape"] = backdrop["id"]
+            kept_items.append(item)
+            tight_removal = dict(removal)
+            tight_removal["tight"] = True
+            kept_removals.append(tight_removal)
+            kept_hints.append(hint)
+            continue
+
+        raster_text.append(
+            {
+                "text": item.get("text", ""),
+                "box_px": item.get("box_px"),
+                "ring_mad": round(float(mad), 2),
+                "background_std": round(float(background_std), 2),
+                "reason": "background is too complex for a clean local repair; kept as raster",
+            }
+        )
+    return kept_items, kept_removals, kept_hints, raster_text, backdrop_shapes
 
 
 def draw_text_hint_overlay(image: Image.Image, hints: list[dict], out_path: Path) -> None:
@@ -1506,6 +2132,46 @@ def _cv2_inpaint(
     return work
 
 
+def _biharmonic_inpaint(
+    original_rgb: np.ndarray,
+    work: np.ndarray,
+    full_mask: np.ndarray,
+    box: list[float],
+    max_mask_fraction: float = 0.35,
+) -> np.ndarray | None:
+    """Biharmonic inpainting for small text masks on smooth backgrounds.
+
+    Telea can pull a neighbouring card/background colour into the glyph area
+    on strong gradients. Biharmonic interpolation is slower but follows the
+    surrounding colour field more smoothly, so it is used when the mask is a
+    modest fraction of the local crop.
+    """
+    if not HAVE_SKIMAGE or inpaint_biharmonic is None:
+        return None
+    height, width = original_rgb.shape[:2]
+    x, y, w, h = [int(round(v)) for v in box]
+    pad = 10
+    x1, y1 = max(0, x - pad), max(0, y - pad)
+    x2, y2 = min(width, x + w + pad), min(height, y + h + pad)
+    if x2 - x1 < 3 or y2 - y1 < 3:
+        return None
+    local_mask = full_mask[y1:y2, x1:x2]
+    if not local_mask.any():
+        return None
+    if float(local_mask.mean()) > max_mask_fraction:
+        return None
+    crop = original_rgb[y1:y2, x1:x2].astype(np.float32) / 255.0
+    try:
+        filled = inpaint_biharmonic(crop, local_mask, channel_axis=-1)
+    except Exception:
+        return None
+    filled = np.clip(filled * 255.0, 0, 255).astype(np.float32)
+    patch = work[y1:y2, x1:x2]
+    patch[local_mask] = filled[local_mask]
+    work[y1:y2, x1:x2] = patch
+    return work
+
+
 def _median_fill(
     original_rgb: np.ndarray,
     work: np.ndarray,
@@ -1553,6 +2219,35 @@ def _median_fill(
     return work
 
 
+def _feather_blend_patch(
+    work: np.ndarray,
+    original: np.ndarray,
+    box: list[float],
+    radius: int = 2,
+) -> None:
+    """Blend a repaired text box into the original at its outer edge."""
+    height, width = work.shape[:2]
+    x, y, w, h = [int(round(v)) for v in box]
+    x1, y1 = max(0, x), max(0, y)
+    x2, y2 = min(width, x + w), min(height, y + h)
+    w, h = x2 - x1, y2 - y1
+    if w < 3 or h < 3:
+        return
+    r = max(1, min(radius, w // 3, h // 3))
+    alpha = np.ones((h, w), dtype=np.float32)
+    ramp = (np.arange(r, dtype=np.float32) + 1.0) / (r + 1.0)
+    for index, value in enumerate(ramp):
+        alpha[index, :] = np.minimum(alpha[index, :], value)
+        alpha[h - 1 - index, :] = np.minimum(alpha[h - 1 - index, :], value)
+        alpha[:, index] = np.minimum(alpha[:, index], value)
+        alpha[:, w - 1 - index] = np.minimum(alpha[:, w - 1 - index], value)
+    original_crop = original[y1:y2, x1:x2].astype(np.float32)
+    work[y1:y2, x1:x2] = (
+        original_crop * (1.0 - alpha[..., None])
+        + work[y1:y2, x1:x2] * alpha[..., None]
+    )
+
+
 def apply_removals(
     original_rgb: np.ndarray,
     removals: list[dict],
@@ -1576,10 +2271,11 @@ def apply_removals(
             mx, my = [int(round(v)) for v in mask_box[:2]]
             full_mask = np.zeros(work.shape[:2], dtype=bool)
             full_mask[my : my + mask.shape[0], mx : mx + mask.shape[1]] = mask
-            if kind == "text" and HAVE_CV2:
+            if kind == "text" and HAVE_CV2 and not removal.get("tight"):
                 # The OCR block box is slightly larger than the measured ink
                 # box. Inpaint the whole padded text box so no antialiased
-                # edge pixels survive as a ghost.
+                # edge pixels survive as a ghost. Backdrop text uses a tight
+                # mask because a native gradient shape covers the area.
                 full_mask[y : y + h, x : x + w] = True
 
         ring, ring_std, ring_mad = sample_ring(original_rgb, box, band=3)
@@ -1591,9 +2287,91 @@ def apply_removals(
             work[y : y + h, x : x + w] = color
             removed_area += w * h
             continue
+        if kind == "text" and removal.get("tight"):
+            # Repair only the glyph pixels so the base has no ghost without a
+            # flat rectangle showing around a native backdrop or decoration.
+            if full_mask is None:
+                continue
+            text_colour = removal.get("text_color")
+            if text_colour:
+                local = original_rgb[y : y + h, x : x + w]
+                if local.size:
+                    near = np.linalg.norm(
+                        local.astype(np.float32)
+                        - np.array(rgb_from_hex(text_colour), dtype=np.float32),
+                        axis=2,
+                    ) <= 120.0
+                    if HAVE_CV2:
+                        near = cv2.dilate(near.astype(np.uint8), np.ones((3, 3), dtype=np.uint8), iterations=1).astype(bool)
+                    full_mask[y : y + near.shape[0], x : x + near.shape[1]] |= near
+            if ring_mad <= 14.0 and _edges_are_flat(original_rgb, box):
+                # The decoration-aware case sits on a flat card; a full-box
+                # fill matches the card and leaves no pale inpainting patch.
+                color = ring if np.linalg.norm(ring - page_background) > 0.5 else page_background
+                work[y : y + h, x : x + w] = color
+                removed_area += w * h
+            else:
+                filled = _biharmonic_inpaint(original_rgb, work, full_mask, box) if HAVE_SKIMAGE else None
+                if filled is not None:
+                    work = filled
+                elif HAVE_CV2:
+                    work = _cv2_inpaint(original_rgb, work, full_mask, box)
+                elif HAVE_SCIPY:
+                    work = _diffuse_fill(work, full_mask, box, ring)
+                else:
+                    work[full_mask] = ring
+                removed_area += int(full_mask.sum())
+            _feather_blend_patch(work, original_rgb, box, radius=2)
+            continue
+        if kind == "text":
+            ink_mask = removal.get("ink_mask")
+            if ink_mask is not None and not _edges_are_flat(original_rgb, box):
+                # On a gradient card a full-box flat fill leaves a visible
+                # rectangle and can carry the text colour into the fill.
+                # Repair only the measured glyph strokes instead, so the
+                # original card gradient stays intact.
+                mask_box = removal.get("mask_box") or box
+                mx, my = [int(round(v)) for v in mask_box[:2]]
+                tight_full = np.zeros(work.shape[:2], dtype=bool)
+                ty2 = min(tight_full.shape[0], my + ink_mask.shape[0])
+                tx2 = min(tight_full.shape[1], mx + ink_mask.shape[1])
+                if ty2 > my and tx2 > mx:
+                    tight_full[my:ty2, mx:tx2] = ink_mask[: ty2 - my, : tx2 - mx]
+                if HAVE_CV2:
+                    tight_full = cv2.dilate(
+                        tight_full.astype(np.uint8),
+                        np.ones((3, 3), dtype=np.uint8),
+                        iterations=3,
+                    ).astype(bool)
+                elif HAVE_SCIPY:
+                    tight_full = ndimage.binary_dilation(tight_full, iterations=3)
+                filled = (
+                    _biharmonic_inpaint(original_rgb, work, tight_full, box)
+                    if HAVE_SKIMAGE
+                    else None
+                )
+                if filled is not None:
+                    work = filled
+                elif HAVE_CV2:
+                    work = _cv2_inpaint(original_rgb, work, tight_full, box)
+                elif HAVE_SCIPY:
+                    work = _diffuse_fill(work, tight_full, box, ring)
+                else:
+                    work[tight_full] = ring
+                removed_area += int(tight_full.sum())
+                continue
+
+            # Every text removal in the base has already passed the
+            # ring-MAD + background-std gate in filter_repairable_text. On a
+            # genuinely flat background a full-box fill is the simplest repair.
+            color = ring if np.linalg.norm(ring - page_background) > 0.5 else page_background
+            work[y : y + h, x : x + w] = color
+            removed_area += w * h
+            _feather_blend_patch(work, original_rgb, box, radius=2)
+            continue
         if ring_mad <= 14.0 and _edges_are_flat(original_rgb, box):
             color = ring if np.linalg.norm(ring - page_background) > 0.5 else page_background
-            if kind in ("text", "foreground") or full_mask is None:
+            if kind == "foreground" or full_mask is None:
                 # On a genuinely uniform background, clearing the whole padded
                 # box is cleaner than clearing only the ink: it removes the
                 # antialiasing halo that a tight glyph/alpha mask leaves.
@@ -1669,36 +2447,139 @@ def _detect_border_and_outer(
     }
 
 
-def _line_thickness(rgb: np.ndarray, points: list[float], color: np.ndarray) -> int:
-    """Measure a line's source thickness from a perpendicular cross-section."""
+def _line_thickness(
+    rgb: np.ndarray,
+    points: list[float],
+    color: np.ndarray,
+    background: np.ndarray,
+    max_thickness: float | None = None,
+) -> int:
+    """Measure a line's source thickness from a perpendicular cross-section.
+
+    A fixed distance threshold counts the whole white neighbourhood of a
+    light-gray line (and produced absurd 12pt strokes on underlines). A pixel
+    belongs to the line only when it is closer to the line colour than to the
+    surrounding background colour.
+    """
     height, width = rgb.shape[:2]
     x1, y1, x2, y2 = [float(v) for v in points]
     target = color.astype(np.float32)
+    outer = background.astype(np.float32)
     if abs(y2 - y1) <= abs(x2 - x1):
         cx = int(round((x1 + x2) / 2.0))
         cy = int(round((y1 + y2) / 2.0))
         if cx < 0 or cx >= width:
             return 1
         column = rgb[:, cx].astype(np.float32)
-        distances = np.linalg.norm(column - target.reshape(1, 3), axis=1)
+        to_line = np.linalg.norm(column - target.reshape(1, 3), axis=1)
+        to_bg = np.linalg.norm(column - outer.reshape(1, 3), axis=1)
         rows = [
             y
             for y in range(max(0, cy - 8), min(height, cy + 9))
-            if distances[y] < 80.0
+            if to_line[y] < to_bg[y] and to_line[y] < 60.0
         ]
-        return max(1, len(rows))
-    cx = int(round((x1 + x2) / 2.0))
-    cy = int(round((y1 + y2) / 2.0))
-    if cy < 0 or cy >= height:
-        return 1
-    row = rgb[cy, :].astype(np.float32)
-    distances = np.linalg.norm(row - target.reshape(1, 3), axis=1)
-    columns = [
-        x
-        for x in range(max(0, cx - 8), min(width, cx + 9))
-        if distances[x] < 80.0
-    ]
-    return max(1, len(columns))
+        count = max(1, len(rows))
+    else:
+        cx = int(round((x1 + x2) / 2.0))
+        cy = int(round((y1 + y2) / 2.0))
+        if cy < 0 or cy >= height:
+            return 1
+        row = rgb[cy, :].astype(np.float32)
+        to_line = np.linalg.norm(row - target.reshape(1, 3), axis=1)
+        to_bg = np.linalg.norm(row - outer.reshape(1, 3), axis=1)
+        columns = [
+            x
+            for x in range(max(0, cx - 8), min(width, cx + 9))
+            if to_line[x] < to_bg[x] and to_line[x] < 60.0
+        ]
+        count = max(1, len(columns))
+    if max_thickness is not None:
+        count = min(count, max(1, int(round(max_thickness))))
+    return count
+
+
+def bake_backdrop_shapes(rgb: np.ndarray, shapes: list[dict]) -> np.ndarray:
+    """Composite native gradient backdrops into the clean base image.
+
+    Baking avoids a separate translucent shape in the slide while keeping the
+    seamless feather/alpha blend. Text boxes remain native on top of the baked
+    background.
+    """
+    work = rgb.astype(np.float32).copy()
+    height, width = work.shape[:2]
+    for shape in shapes:
+        box = shape.get("box_px")
+        if not box:
+            continue
+        x, y, w, h = [int(round(v)) for v in box]
+        x1, y1 = max(0, x), max(0, y)
+        x2, y2 = min(width, x + w), min(height, y + h)
+        cw, ch = x2 - x1, y2 - y1
+        if cw < 2 or ch < 2:
+            continue
+        fill = shape.get("fill")
+        gradient = None
+        if isinstance(fill, dict) and fill.get("type") == "gradient":
+            gradient = gradient_fill_image(cw, ch, fill)
+        elif isinstance(fill, dict) and fill.get("color"):
+            gradient = Image.new("RGB", (cw, ch), rgb_from_hex(fill["color"]))
+        elif isinstance(fill, str) and fill and fill != "none":
+            gradient = Image.new("RGB", (cw, ch), rgb_from_hex(fill))
+        if gradient is None:
+            continue
+
+        mask = Image.new("L", (cw, ch), 0)
+        if shape.get("type") == "freeform" and shape.get("path_px"):
+            points = [
+                (float(point[0]) - x, float(point[1]) - y)
+                for point in shape["path_px"]
+                if len(point) >= 2
+            ]
+            if len(points) < 3:
+                continue
+            ImageDraw.Draw(mask).polygon(points, fill=255)
+        else:
+            mask = Image.new("L", (cw, ch), 255)
+
+        try:
+            soft_edge = float(shape.get("soft_edge_ratio") or 0)
+        except (TypeError, ValueError):
+            soft_edge = 0.0
+        try:
+            alpha_value = float(fill.get("alpha", 1.0)) if isinstance(fill, dict) else 1.0
+        except (TypeError, ValueError):
+            alpha_value = 1.0
+
+        # Poisson blending matches the gradient patch to the destination at
+        # the mask boundary, which hides small colour seams far better than a
+        # plain alpha composite. It needs a binary mask, so manual soft-edge
+        # or semi-transparent shapes fall back to the alpha path.
+        if HAVE_CV2 and soft_edge <= 0 and alpha_value >= 1.0:
+            try:
+                source = cv2.cvtColor(np.asarray(gradient), cv2.COLOR_RGB2BGR)
+                destination = cv2.cvtColor(
+                    np.clip(work, 0, 255).astype(np.uint8), cv2.COLOR_RGB2BGR
+                )
+                binary_mask = np.asarray(mask)
+                center = (x1 + cw // 2, y1 + ch // 2)
+                blended = cv2.seamlessClone(
+                    source, destination, binary_mask, center, cv2.NORMAL_CLONE
+                )
+                work = cv2.cvtColor(blended, cv2.COLOR_BGR2RGB).astype(np.float32)
+                continue
+            except Exception:
+                pass
+
+        if soft_edge > 0:
+            mask = mask.filter(ImageFilter.GaussianBlur(max(0.5, min(cw, ch) * soft_edge)))
+        if 0.0 < alpha_value < 1.0:
+            mask = mask.point(lambda value: int(round(value * alpha_value)))
+
+        alpha = np.asarray(mask, dtype=np.float32)[..., None] / 255.0
+        gradient_array = np.asarray(gradient, dtype=np.float32)
+        region = work[y1:y2, x1:x2]
+        region[:] = region * (1.0 - alpha) + gradient_array * alpha
+    return np.clip(work, 0, 255).astype(np.uint8)
 
 
 def detect_native_shapes(
@@ -1914,7 +2795,16 @@ def detect_native_shapes(
                     else:
                         cx = (x1 + x2) / 2.0
                         points = [cx, y1, cx, y2]
-                    thickness_src = float(_line_thickness(full_rgb, points, colors[index]))
+                    bbox_thickness_src = float(bh if orientation == "h" else bw) / max(scale, 1e-6)
+                    thickness_src = float(
+                        _line_thickness(
+                            full_rgb,
+                            points,
+                            colors[index],
+                            info["outer"],
+                            max_thickness=bbox_thickness_src * 2.0 + 2.0,
+                        )
+                    )
                     line = {
                         "id": f"s{len(shapes) + 1:03d}",
                         "type": "line",
@@ -2127,6 +3017,50 @@ def detect_foreground_assets(
                 "pixels": pixels,
             }
         )
+
+    # A chart panel is a large light canvas containing many small marks
+    # (bars, tick labels, legend swatches). Separating those marks as
+    # individual "icons" fragments the chart. Protect such panels: if a large
+    # light region contains many candidates, keep the whole region raster.
+    if components and HAVE_SCIPY:
+        light = (arr.min(axis=2) >= 235.0) & ((arr.max(axis=2) - arr.min(axis=2)) <= 20.0)
+        light = ndimage.binary_closing(light, structure=np.ones((3, 3), dtype=bool))
+        light_labels, light_count = ndimage.label(light, structure=np.ones((3, 3), dtype=bool))
+        light_slices = ndimage.find_objects(light_labels)
+        protected: list[list[float]] = []
+        for label_id in range(1, light_count + 1):
+            sl = light_slices[label_id - 1]
+            if sl is None:
+                continue
+            ys, xs = sl
+            bw, bh = xs.stop - xs.start, ys.stop - ys.start
+            bbox_area = float(bw * bh)
+            if bbox_area < 0.06 * total or bbox_area > 0.55 * total:
+                continue
+            if bw < 0.12 * width or bh < 0.10 * height:
+                continue
+            panel = [xs.start, ys.start, bw, bh]
+            inside = []
+            for component in components:
+                cx = component["box_small"][0] + component["box_small"][2] / 2.0
+                cy = component["box_small"][1] + component["box_small"][3] / 2.0
+                if xs.start <= cx <= xs.stop and ys.start <= cy <= ys.stop:
+                    inside.append(component)
+            if len(inside) >= 8:
+                protected.append(panel)
+        if protected:
+            kept = []
+            removed = 0
+            for component in components:
+                cx = component["box_small"][0] + component["box_small"][2] / 2.0
+                cy = component["box_small"][1] + component["box_small"][3] / 2.0
+                if any(p[0] <= cx <= p[0] + p[2] and p[1] <= cy <= p[1] + p[3] for p in protected):
+                    removed += 1
+                else:
+                    kept.append(component)
+            if removed:
+                log(f"  kept {removed} chart/panel fragment(s) raster")
+            components = kept
 
     components.sort(key=lambda entry: -entry["area"])
     components = components[:max_assets]
@@ -2377,6 +3311,25 @@ def normalize_position_item(manifest: dict, item: dict) -> dict:
             item["flip_h"] = True
         if float(y2) < float(y1):
             item["flip_v"] = True
+    if "path_px" in item:
+        raw_points = item.get("path_px") or []
+        points = [(float(point[0]), float(point[1])) for point in raw_points if len(point) >= 2]
+        if len(points) >= 3:
+            point_x = [point[0] for point in points]
+            point_y = [point[1] for point in points]
+            left = min(point_x)
+            top = min(point_y)
+            width = max(point_x) - left
+            height = max(point_y) - top
+            if "box_px" not in item:
+                item.update(manifest_px_to_inches(manifest, left, top, width, height))
+            base_left = float(item.get("left", 0))
+            base_top = float(item.get("top", 0))
+            relative = []
+            for point_x_value, point_y_value in points:
+                position = manifest_px_to_inches(manifest, point_x_value, point_y_value, 0, 0)
+                relative.append([position["left"] - base_left, position["top"] - base_top])
+            item["path"] = relative
     if item.get("source_corner_radius_px") is not None and "radius" not in item:
         radius = float(item.get("source_corner_radius_px") or 0)
         item["radius"] = manifest_px_to_inches(manifest, 0, 0, radius, radius)["width"]
@@ -2464,7 +3417,33 @@ def normalize_manifest(manifest: dict) -> dict:
     return normalized
 
 
-def shape_fill(fill: str | None) -> str:
+def shape_fill(fill) -> str:
+    if fill is None or fill == "none":
+        return "<a:noFill/>"
+    if isinstance(fill, dict):
+        if fill.get("type") == "gradient":
+            stops = fill.get("stops") or []
+            if len(stops) >= 2:
+                alpha_xml = ""
+                try:
+                    alpha_value = float(fill.get("alpha", 1.0))
+                    if 0.0 < alpha_value < 1.0:
+                        alpha_xml = f'<a:alpha val="{int(round(alpha_value * 100000))}"/>'
+                except (TypeError, ValueError):
+                    alpha_xml = ""
+                stop_xml = "".join(
+                    f'<a:gs pos="{int(round(float(stop.get("pos", 0)) * 100000))}">'
+                    f'<a:srgbClr val="{hex_color(stop.get("color"))}">{alpha_xml}</a:srgbClr></a:gs>'
+                    for stop in stops
+                )
+                angle = float(fill.get("angle", 0)) % 360.0
+                return (
+                    '<a:gradFill rotWithShape="1">'
+                    f"<a:gsLst>{stop_xml}</a:gsLst>"
+                    f'<a:lin ang="{int(round(angle * 60000))}" scaled="0"/>'
+                    "</a:gradFill>"
+                )
+        fill = fill.get("color")
     if not fill or fill == "none":
         return "<a:noFill/>"
     return f'<a:solidFill><a:srgbClr val="{hex_color(fill)}"/></a:solidFill>'
@@ -2585,6 +3564,45 @@ def preset_geometry_xml(preset: str, item: dict) -> str:
     )
 
 
+def freeform_geometry_xml(item: dict) -> str:
+    width = max(1, emu(item.get("width", 1)))
+    height = max(1, emu(item.get("height", 1)))
+    points = []
+    for point in item.get("path") or []:
+        x = max(0, min(width, int(round(float(point[0]) * EMU_PER_INCH))))
+        y = max(0, min(height, int(round(float(point[1]) * EMU_PER_INCH))))
+        points.append((x, y))
+    if len(points) < 3:
+        return '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>'
+    commands = [f'<a:moveTo><a:pt x="{points[0][0]}" y="{points[0][1]}"/></a:moveTo>']
+    commands.extend(
+        f'<a:lnTo><a:pt x="{x}" y="{y}"/></a:lnTo>' for x, y in points[1:]
+    )
+    commands.append("<a:close/>")
+    return (
+        "<a:custGeom><a:avLst/><a:gdLst/><a:ahLst/><a:cxnLst/>"
+        f'<a:rect l="0" t="0" r="{width}" b="{height}"/>'
+        f'<a:pathLst><a:path w="{width}" h="{height}">{"".join(commands)}</a:path></a:pathLst>'
+        "</a:custGeom>"
+    )
+
+
+def shape_effects_xml(item: dict) -> str:
+    ratio = item.get("soft_edge_ratio")
+    if not ratio:
+        return ""
+    try:
+        ratio_value = float(ratio)
+    except (TypeError, ValueError):
+        return ""
+    if ratio_value <= 0:
+        return ""
+    width = float(item.get("width", 1))
+    height = float(item.get("height", 1))
+    radius = max(1, emu(min(width, height) * ratio_value))
+    return f'<a:effectLst><a:softEdge rad="{radius}"/></a:effectLst>'
+
+
 def shape_xml(index: int, item: dict) -> str:
     kind = item.get("type", "rect")
     left = emu(item.get("left", 0))
@@ -2596,14 +3614,15 @@ def shape_xml(index: int, item: dict) -> str:
     flip_v = ' flipV="1"' if item.get("flip_v") else ""
     fill = shape_fill(item.get("fill"))
     line = shape_line_xml(item.get("stroke", "#000000"), stroke_width, item.get("dash"), item.get("start_arrow"), item.get("end_arrow"))
+    effects = shape_effects_xml(item)
     preset = item.get("preset")
     if not preset:
         preset = "line" if kind == "line" else "ellipse" if kind == "ellipse" else "roundRect" if kind == "roundRect" else "rect"
-    geometry = preset_geometry_xml(preset, item)
+    geometry = freeform_geometry_xml(item) if kind == "freeform" else preset_geometry_xml(preset, item)
     return f"""
       <p:sp>
         <p:nvSpPr><p:cNvPr id="{index}" name="{xml_text(kind.title())} {index}"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
-        <p:spPr><a:xfrm{flip_h}{flip_v}><a:off x="{left}" y="{top}"/><a:ext cx="{width}" cy="{height}"/></a:xfrm>{geometry}{fill}{line}</p:spPr>
+        <p:spPr><a:xfrm{flip_h}{flip_v}><a:off x="{left}" y="{top}"/><a:ext cx="{width}" cy="{height}"/></a:xfrm>{geometry}{fill}{line}{effects}</p:spPr>
         <p:txBody><a:bodyPr/><a:lstStyle/><a:p/></p:txBody>
       </p:sp>"""
 
@@ -2853,6 +3872,36 @@ def preview_font_path(cjk: bool = True, bold: bool = False) -> str | None:
     return None
 
 
+def gradient_fill_image(width: int, height: int, fill: dict) -> Image.Image | None:
+    """Render a linear gradient fill for the preview."""
+    stops = sorted(fill.get("stops") or [], key=lambda stop: float(stop.get("pos", 0)))
+    if len(stops) < 2 or width < 1 or height < 1:
+        return None
+    positions = []
+    colors = []
+    for stop in stops:
+        positions.append(float(stop.get("pos", 0)))
+        colors.append(rgb_from_hex(stop.get("color", "#FFFFFF")))
+    for index in range(1, len(positions)):
+        if positions[index] <= positions[index - 1]:
+            positions[index] = positions[index - 1] + 1e-4
+    angle = math.radians(float(fill.get("angle", 0)))
+    x = np.arange(width, dtype=np.float32)[None, :] - (width - 1) / 2.0
+    y = np.arange(height, dtype=np.float32)[:, None] - (height - 1) / 2.0
+    projection = x * math.cos(angle) + y * math.sin(angle)
+    low, high = float(projection.min()), float(projection.max())
+    if high - low < 1e-6:
+        projection[:] = 0.0
+    else:
+        projection = (projection - low) / (high - low)
+    channel_values = [
+        np.interp(projection, positions, [colour[channel] for colour in colors])
+        for channel in range(3)
+    ]
+    array = np.stack(channel_values, axis=-1)
+    return Image.fromarray(np.clip(array, 0, 255).astype(np.uint8), "RGB")
+
+
 def render_preview(manifest: dict, manifest_path: Path, out_path: Path, scale: int = 120) -> None:
     normalized = normalize_manifest(manifest)
     slide = normalized.get("slide", {})
@@ -2870,19 +3919,71 @@ def render_preview(manifest: dict, manifest_path: Path, out_path: Path, scale: i
             (item.get("top", 0) + item.get("height", 1)) * scale,
         ]
         fill = item.get("fill")
+        solid_fill = fill if isinstance(fill, str) else None
         stroke = item.get("stroke", "#000000")
         outline = None if not stroke or stroke == "none" else stroke
         line_width = max(1, int(round(float(item.get("stroke_width", 1)) * scale / 72.0)))
         if item.get("type") == "line" and "points" in item:
             pts = item["points"]
             draw.line([(pts[0] * scale, pts[1] * scale), (pts[2] * scale, pts[3] * scale)], fill=outline or "#000000", width=line_width)
+        elif item.get("type") == "freeform" and item.get("path"):
+            points = [(box[0] + float(point[0]) * scale, box[1] + float(point[1]) * scale) for point in item["path"]]
+            if isinstance(fill, dict) and fill.get("type") == "gradient":
+                width_px = max(1, int(round(box[2] - box[0])))
+                height_px = max(1, int(round(box[3] - box[1])))
+                gradient = gradient_fill_image(width_px, height_px, fill)
+                if gradient is not None:
+                    mask = Image.new("L", (width_px, height_px), 0)
+                    ImageDraw.Draw(mask).polygon(
+                        [(point[0] - box[0], point[1] - box[1]) for point in points],
+                        fill=255,
+                    )
+                    soft_edge = float(item.get("soft_edge_ratio") or 0)
+                    if soft_edge > 0:
+                        mask = mask.filter(
+                            ImageFilter.GaussianBlur(max(1.0, min(width_px, height_px) * soft_edge))
+                        )
+                    try:
+                        fill_alpha = float(fill.get("alpha", 1.0))
+                    except (TypeError, ValueError):
+                        fill_alpha = 1.0
+                    if 0.0 < fill_alpha < 1.0:
+                        mask = mask.point(lambda value: int(round(value * fill_alpha)))
+                    canvas.paste(gradient, (int(round(box[0])), int(round(box[1]))), mask)
+            else:
+                draw.polygon(points, fill=None if not solid_fill or solid_fill == "none" else solid_fill, outline=outline)
         elif item.get("type") == "ellipse":
-            draw.ellipse(box, fill=None if not fill or fill == "none" else fill, outline=outline, width=line_width)
+            draw.ellipse(box, fill=None if not solid_fill or solid_fill == "none" else solid_fill, outline=outline, width=line_width)
         elif item.get("type") == "roundRect":
             radius = max(1, int(round(float(item.get("radius", 0.08)) * scale)))
-            draw.rounded_rectangle(box, radius=radius, fill=None if not fill or fill == "none" else fill, outline=outline, width=line_width)
+            draw.rounded_rectangle(box, radius=radius, fill=None if not solid_fill or solid_fill == "none" else solid_fill, outline=outline, width=line_width)
+        elif item.get("type") in ("rect", "") and isinstance(fill, dict) and fill.get("type") == "gradient":
+            gradient = gradient_fill_image(
+                max(1, int(round(box[2] - box[0]))),
+                max(1, int(round(box[3] - box[1]))),
+                fill,
+            )
+            if gradient is not None:
+                soft_edge = float(item.get("soft_edge_ratio") or 0)
+                if soft_edge > 0:
+                    mask = Image.new("L", gradient.size, 255).filter(
+                        ImageFilter.GaussianBlur(
+                            max(1.0, min(gradient.size) * soft_edge)
+                        )
+                    )
+                    try:
+                        fill_alpha = float(fill.get("alpha", 1.0))
+                    except (TypeError, ValueError):
+                        fill_alpha = 1.0
+                    if 0.0 < fill_alpha < 1.0:
+                        mask = mask.point(lambda value: int(round(value * fill_alpha)))
+                    canvas.paste(gradient, (int(round(box[0])), int(round(box[1]))), mask)
+                else:
+                    canvas.paste(gradient, (int(round(box[0])), int(round(box[1]))))
+            if outline:
+                draw.rectangle(box, outline=outline, width=line_width)
         else:
-            draw.rectangle(box, fill=None if not fill or fill == "none" else fill, outline=outline, width=line_width)
+            draw.rectangle(box, fill=None if not solid_fill or solid_fill == "none" else solid_fill, outline=outline, width=line_width)
 
     def draw_image(item: dict) -> None:
         src = Path(item["path"])
@@ -3100,6 +4201,7 @@ def process_page(
     ocr_backend: str,
     paddle_token: str | None,
     paddle_model: str,
+    chart_recognition: bool,
     mode: str,
     font_cjk: str,
     font_latin: str,
@@ -3107,6 +4209,9 @@ def process_page(
     detect_shapes: bool,
     no_text_fit: bool,
     raster_text_mad: float,
+    raster_text_std: float,
+    gradient_backdrops: bool,
+    bake_backdrops: bool,
     max_source_side: int,
     bg_max_width: int,
 ) -> dict:
@@ -3158,7 +4263,13 @@ def process_page(
 
     # --- Step 1: text ------------------------------------------------------
     used_backend, blocks = run_ocr(
-        source_png, ocr_backend, paddle_token, paddle_model, source_width, source_height
+        source_png,
+        ocr_backend,
+        paddle_token,
+        paddle_model,
+        source_width,
+        source_height,
+        chart_recognition=chart_recognition,
     )
     if used_backend == "none":
         warn("OCR unavailable; text remains in the clean base image (the deck is not fully editable).")
@@ -3177,9 +4288,20 @@ def process_page(
     draw_text_hint_overlay(image, hints, page_dir / "text_hints.png")
 
     original_text_count = len(text_items)
-    text_items, text_removals, _kept_hints, raster_text = filter_repairable_text(
-        text_items, text_removals, hints, rgb, mad_threshold=raster_text_mad
+    text_items, text_removals, _kept_hints, raster_text, backdrop_shapes = filter_repairable_text(
+        text_items,
+        text_removals,
+        hints,
+        rgb,
+        mad_threshold=raster_text_mad,
+        std_threshold=raster_text_std,
+        gradient_backdrops=gradient_backdrops,
     )
+    if backdrop_shapes:
+        if bake_backdrops:
+            log(f"  gradient backdrops: {len(backdrop_shapes)} text block(s) blended into the clean base")
+        else:
+            log(f"  gradient backdrops: {len(backdrop_shapes)} text block(s) rebuilt as native gradient shapes")
     if raster_text:
         warn(
             f"{len(raster_text)} text block(s) kept as raster because the background is too "
@@ -3203,6 +4325,29 @@ def process_page(
         log(f"  native shapes: {len(shapes)}")
     else:
         log("  native shapes: disabled")
+
+    if backdrop_shapes:
+        if not bake_backdrops:
+            # A one-pixel edge blend hides residual colour jumps without the
+            # visible blur of a proportional (5-10%) soft edge.
+            for shape in backdrop_shapes:
+                box = shape.get("box_px") or [0, 0, 1, 1]
+                short_side = max(1.0, float(min(box[2], box[3])))
+                shape["soft_edge_ratio"] = 1.0 / short_side
+            shapes.extend(backdrop_shapes)
+        visual_inventory.extend(
+            {
+                "id": shape.get("id"),
+                "role": "backdrop",
+                "object_type": "baked-gradient-backdrop" if bake_backdrops else "gradient-backdrop",
+                "description": (
+                    "gradient patch blended into the clean base"
+                    if bake_backdrops
+                    else shape.get("reason", "native gradient patch behind editable text")
+                ),
+            }
+            for shape in backdrop_shapes
+        )
 
     # --- Step 3: foreground assets ----------------------------------------
     images_manifest: list[dict] = []
@@ -3230,6 +4375,8 @@ def process_page(
     # --- Step 4: clean base ------------------------------------------------
     removals = text_removals + shape_removals + asset_removals
     base_rgb, removed_area = apply_removals(rgb, removals, page_background)
+    if backdrop_shapes and bake_backdrops:
+        base_rgb = bake_backdrop_shapes(base_rgb, backdrop_shapes)
     base_image = Image.fromarray(base_rgb, "RGB")
 
     # If nothing editable was removed and no native object exists, this is a
@@ -3241,7 +4388,8 @@ def process_page(
     base_arr = np.asarray(base_image, dtype=np.int16)
     diff = np.abs(base_arr - page_background.reshape(1, 1, 3)).max(axis=2)
     uniform_fraction = float((diff <= 6).mean())
-    base_is_uniform = uniform_fraction >= 0.985
+    baked_backdrops = bool(backdrop_shapes and bake_backdrops)
+    base_is_uniform = uniform_fraction >= 0.985 and not baked_backdrops
     if base_is_uniform:
         if (base_image.width, base_image.height) != (source_width, source_height):
             base_image = base_image.resize((source_width, source_height), Image.LANCZOS)
@@ -3420,11 +4568,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--ocr",
         default="auto",
-        choices=["auto", "paddleocr-vl", "rapidocr", "tesseract", "none"],
-        help="OCR backend. auto prefers PaddleOCR-VL (token) > RapidOCR > Tesseract.",
+        choices=["auto", "ppocrv6", "paddleocr-vl", "rapidocr", "tesseract", "none"],
+        help=(
+            "OCR backend. auto prefers PP-OCRv6 (cloud, line-level) > RapidOCR > Tesseract. "
+            "PaddleOCR-VL is available explicitly for layout parsing."
+        ),
     )
-    parser.add_argument("--paddle-token", help="PaddleOCR-VL token (defaults to PADDLE_OCR_TOKEN or ~/.editppt/config.yaml).")
-    parser.add_argument("--paddle-model", default=PADDLE_DEFAULT_MODEL)
+    parser.add_argument(
+        "--paddle-token",
+        help="Paddle OCR token (defaults to PADDLE_OCR_TOKEN or ~/.editppt/config.yaml).",
+    )
+    parser.add_argument(
+        "--paddle-model",
+        default=PADDLE_DEFAULT_MODEL,
+        help=f"PaddleOCR-VL model used by --ocr paddleocr-vl (default: {PADDLE_DEFAULT_MODEL}).",
+    )
+    parser.add_argument(
+        "--chart-recognition",
+        action="store_true",
+        help="Ask PaddleOCR-VL to parse charts; figure titles/footers may be returned as text. Chart internals stay raster.",
+    )
     parser.add_argument(
         "--mode",
         default="auto",
@@ -3433,14 +4596,67 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--font-cjk", default=DEFAULT_FONT_CJK)
     parser.add_argument("--font-latin", default=DEFAULT_FONT_LATIN)
-    parser.add_argument("--no-icons", action="store_true", help="Do not separate foreground icons.")
+    icon_group = parser.add_mutually_exclusive_group()
+    icon_group.add_argument(
+        "--icons",
+        dest="extract_icons",
+        action="store_true",
+        help="Separate foreground icons into PNG assets (off by default).",
+    )
+    icon_group.add_argument(
+        "--no-icons",
+        dest="extract_icons",
+        action="store_false",
+        help="Keep icons in the clean base (default).",
+    )
+    parser.set_defaults(extract_icons=False)
+    backdrop_group = parser.add_mutually_exclusive_group()
+    backdrop_group.add_argument(
+        "--gradient-backdrops",
+        dest="gradient_backdrops",
+        action="store_true",
+        help="Rebuild text on smooth coloured gradients as native gradient shapes (default in editability).",
+    )
+    backdrop_group.add_argument(
+        "--no-gradient-backdrops",
+        dest="gradient_backdrops",
+        action="store_false",
+        help="Keep text on gradients as raster (default in balanced).",
+    )
+    parser.set_defaults(gradient_backdrops=None)
+    bake_group = parser.add_mutually_exclusive_group()
+    bake_group.add_argument(
+        "--bake-backdrops",
+        dest="bake_backdrops",
+        action="store_true",
+        help="Blend gradient backdrops into the clean background image (default).",
+    )
+    bake_group.add_argument(
+        "--keep-backdrop-shapes",
+        dest="bake_backdrops",
+        action="store_false",
+        help="Keep gradient backdrops as separate native shapes instead of baking them into the background.",
+    )
+    parser.set_defaults(bake_backdrops=True)
     parser.add_argument("--no-shapes", action="store_true", help="Do not rebuild flat cards/lines natively.")
     parser.add_argument("--no-text-fit", action="store_true", help="Disable deterministic font-size clamping.")
     parser.add_argument(
+        "--profile",
+        choices=["balanced", "editability"],
+        default="editability",
+        help="editability raises the text nativization threshold (default); balanced keeps more text raster for fidelity.",
+    )
+    parser.add_argument(
         "--raster-text-mad",
         type=float,
-        default=15.0,
-        help="Background-complexity threshold; text above it stays raster. Default: 15.",
+        default=None,
+        help="Ring-uniformity threshold; text above it stays raster. Default: 18 for editability, 15 for balanced.",
+    )
+    parser.add_argument(
+        "--raster-text-std",
+        type=float,
+        default=None,
+        help="Non-text background spread threshold inside a text box; text above it stays raster. Default: 50 (editability) / 20 (balanced).",
     )
     parser.add_argument(
         "--max-source-side",
@@ -3458,6 +4674,14 @@ def main(argv: list[str] | None = None) -> int:
     WARNINGS = []
     args = parse_args(argv)
     QUIET = bool(args.quiet)
+    if args.raster_text_mad is None:
+        args.raster_text_mad = 18.0 if args.profile == "editability" else 15.0
+    if args.raster_text_std is None:
+        args.raster_text_std = 50.0 if args.profile == "editability" else 20.0
+    if args.gradient_backdrops is None:
+        args.gradient_backdrops = args.profile == "editability"
+    # The editability profile is the default: this tool prefers real text
+    # objects even when that costs some background fidelity.
 
     if args.from_manifest:
         if args.inputs:
@@ -3541,9 +4765,9 @@ def main(argv: list[str] | None = None) -> int:
     detected = detect_ocr_backend(args.ocr)
     # Only touch the credential store when the Paddle backend is actually in
     # use; offline backends never need the token.
-    paddle_token = load_paddle_token(args.paddle_token) if detected == "paddleocr-vl" else None
+    paddle_token = load_paddle_token(args.paddle_token) if detected in ("ppocrv6", "paddleocr-vl") else None
     if detected == "none":
-        warn("No OCR backend available. Install RapidOCR (`pip install rapidocr onnxruntime`) or configure a PaddleOCR-VL token.")
+        warn("No OCR backend available. Install RapidOCR (`pip install rapidocr onnxruntime`) or configure a Paddle OCR token.")
     else:
         log(f"OCR backend: {detected}")
 
@@ -3563,13 +4787,17 @@ def main(argv: list[str] | None = None) -> int:
             ocr_backend=detected,
             paddle_token=paddle_token,
             paddle_model=args.paddle_model,
+            chart_recognition=args.chart_recognition,
             mode=args.mode,
             font_cjk=args.font_cjk,
             font_latin=args.font_latin,
-            extract_icons=not args.no_icons,
+            extract_icons=args.extract_icons,
             detect_shapes=not args.no_shapes,
             no_text_fit=args.no_text_fit,
             raster_text_mad=args.raster_text_mad,
+            raster_text_std=args.raster_text_std,
+            gradient_backdrops=bool(args.gradient_backdrops),
+            bake_backdrops=bool(args.bake_backdrops),
             max_source_side=args.max_source_side,
             bg_max_width=args.bg_max_width,
         )
